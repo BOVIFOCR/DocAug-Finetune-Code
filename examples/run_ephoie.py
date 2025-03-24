@@ -1,25 +1,29 @@
 #!/usr/bin/env python
 # coding=utf-8
 with open('tag.txt', 'w') as tagf:
-    tagf.write('multilingual')
+    tagf.write('monolingual')
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
-from datasets import ClassLabel, load_dataset
+from datasets import ClassLabel, load_dataset, load_metric
 
-import LiLTfinetune.data.datasets.xfun
+#import LiLTfinetune.data.datasets.funsd_dataset as dtss
+import LiLTfinetune.data.datasets.ephoie_dataset as dtss
+#import LiLTfinetune.data.datasets.funsd_aug as dtss
+#import LiLTfinetune.data.datasets.funsd as dtss
 import transformers
 from transformers import EarlyStoppingCallback
-from LiLTfinetune import AutoModelForRelationExtraction
-from LiLTfinetune.data.data_args import XFUNDataTrainingArguments
-from LiLTfinetune.data.data_collator import DataCollatorForKeyValueExtraction
-from LiLTfinetune.evaluation import re_score
+from LiLTfinetune.data import DataCollatorForKeyValueExtraction
+from LiLTfinetune.data.data_args import DataTrainingArguments
 from LiLTfinetune.models.model_args import ModelArguments
-from LiLTfinetune.trainers import XfunReTrainer
+from LiLTfinetune.trainers import FunsdTrainer as Trainer
 from transformers import (
     AutoConfig,
+    AutoModelForTokenClassification,
     AutoTokenizer,
     HfArgumentParser,
     PreTrainedTokenizerFast,
@@ -27,17 +31,21 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from transformers.utils import check_min_version
 
+
+# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
+check_min_version("4.5.0")
 
 logger = logging.getLogger(__name__)
 
 
 def main():
-    # See all possible arguments in src/transformers/training_args.py
+    # See all possible arguments in layoutlmft/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, XFUNDataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
@@ -83,26 +91,25 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
     if data_args.n_augs:
-        cfg = f"funsd aug {data_args.n_augs}"
+        cfg = f"ephoie aug {data_args.n_augs}"
     else:
-        cfg = "funsd aug 0"
+        cfg = "ephoie aug 0"
     if data_args.partition:
         cfg += f" part {data_args.partition}"
 
-    datasets = load_dataset(
-        os.path.abspath(LiLTfinetune.data.datasets.xfun.__file__),
-#        f"xfun.en.aug{data_args.n_augs}",
-        cfg,
-        keep_in_memory=True,
-    )
+    datasets = load_dataset(os.path.abspath(dtss.__file__), cfg)
+    print(datasets)
+
     if training_args.do_train:
         column_names = datasets["train"].column_names
         features = datasets["train"].features
     else:
         column_names = datasets["test"].column_names
         features = datasets["test"].features
-    text_column_name = "input_ids"
-    label_column_name = "labels"
+    text_column_name = "tokens" if "tokens" in column_names else column_names[0]
+    label_column_name = (
+        f"{data_args.task_name}_tags" if f"{data_args.task_name}_tags" in column_names else column_names[1]
+    )
 
     remove_columns = column_names
 
@@ -144,8 +151,9 @@ def main():
         use_fast=True,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        add_prefix_space=True,
     )
-    model = AutoModelForRelationExtraction.from_pretrained(
+    model = AutoModelForTokenClassification.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
@@ -166,26 +174,96 @@ def main():
     # Padding strategy
     padding = "max_length" if data_args.pad_to_max_length else False
 
+    # Tokenize all texts and align the labels with them.
+    def tokenize_and_align_labels(examples):
+        tokenized_inputs = tokenizer(
+            examples[text_column_name],
+            padding=padding,
+            truncation=True,
+            return_overflowing_tokens=True,
+            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
+            is_split_into_words=True,
+        )
+
+        labels = []
+        bboxes = []
+        images = []
+        for batch_index in range(len(tokenized_inputs["input_ids"])):
+            word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
+            org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
+
+            label = examples[label_column_name][org_batch_index]
+            bbox = examples["bboxes"][org_batch_index]
+            image = examples["image"][org_batch_index]
+            previous_word_idx = None
+            label_ids = []
+            bbox_inputs = []
+            for word_idx in word_ids:
+                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
+                # ignored in the loss function.
+                if word_idx is None:
+                    label_ids.append(-100)
+                    bbox_inputs.append([0, 0, 0, 0])
+                # We set the label for the first token of each word.
+                elif word_idx != previous_word_idx:
+                    label_ids.append(label_to_id[label[word_idx]])
+                    bbox_inputs.append(bbox[word_idx])
+                # For the other tokens in a word, we set the label to either the current label or -100, depending on
+                # the label_all_tokens flag.
+                else:
+                    label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
+                    bbox_inputs.append(bbox[word_idx])
+                previous_word_idx = word_idx
+            labels.append(label_ids)
+            bboxes.append(bbox_inputs)
+            images.append(image)
+        tokenized_inputs["labels"] = labels
+        tokenized_inputs["bbox"] = bboxes
+        tokenized_inputs["image"] = images
+        return tokenized_inputs
+
     if training_args.do_train:
         if "train" not in datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = datasets["train"]
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
+        train_dataset = train_dataset.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
 
     if training_args.do_eval:
-        #if "validation" not in datasets:
-        #    raise ValueError("--do_eval requires a validation dataset")
+        if "validation" not in datasets:
+            raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = datasets["validation"]
         if data_args.max_val_samples is not None:
             eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
+        eval_dataset = eval_dataset.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
 
     if training_args.do_predict:
         if "test" not in datasets:
             raise ValueError("--do_predict requires a test dataset")
-        test_dataset = datasets["test"]
+        test_dataset = datasets["validation"]
+        tdts = datasets["validation"]
         if data_args.max_test_samples is not None:
             test_dataset = test_dataset.select(range(data_args.max_test_samples))
+        test_dataset = test_dataset.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
 
     # Data collator
     data_collator = DataCollatorForKeyValueExtraction(
@@ -195,17 +273,51 @@ def main():
         max_length=512,
     )
 
-    def compute_metrics(p):
-        pred_relations, gt_relations = p
-        score = re_score(pred_relations, gt_relations, mode="boundaries")
-        return score
+    # Metrics
+    metric = load_metric("seqeval")
 
-    patience = 100
-    es = EarlyStoppingCallback(early_stopping_patience = patience)
-    cbs = [es]
+    def compute_metrics(p):
+        predictions, labels = p
+        predictions = np.argmax(predictions, axis=2)
+
+        # Remove ignored index (special tokens)
+        true_predictions = [
+            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions, labels)
+        ]
+        true_labels = [
+            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions, labels)
+        ]
+
+        results = metric.compute(predictions=true_predictions, references=true_labels)
+        if data_args.return_entity_level_metrics:
+            # Unpack nested dictionaries
+            final_results = {}
+            for key, value in results.items():
+                if isinstance(value, dict):
+                    for n, v in value.items():
+                        final_results[f"{key}_{n}"] = v
+                else:
+                    final_results[key] = value
+            return final_results
+        else:
+            return {
+                "precision": results["overall_precision"],
+                "recall": results["overall_recall"],
+                "f1": results["overall_f1"],
+                "accuracy": results["overall_accuracy"],
+            }
+    patience = 20
+    if patience > 0 and training_args.do_eval:
+        es = EarlyStoppingCallback(early_stopping_patience = patience)
+        cbs = [es]
+    else:
+        cbs = []
+
 
     # Initialize our Trainer
-    trainer = XfunReTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -213,7 +325,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        #callbacks=cbs
+        callbacks=cbs
     )
 
     # Training
@@ -244,29 +356,29 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
+    # Predict
     if training_args.do_predict:
         logger.info("*** Predict ***")
 
-        metrics = trainer.evaluate(test_dataset)
-        #predictions, labels, metrics = trainer.predict(test_dataset)
-        #predictions = np.argmax(predictions, axis=2)
+        predictions, labels, metrics = trainer.predict(test_dataset)
+        predictions = np.argmax(predictions, axis=2)
 
         # Remove ignored index (special tokens)
-        #true_predictions = [
-        #    [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-        #    for prediction, label in zip(predictions, labels)
-        #]
+        true_predictions = [
+            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions, labels)
+        ]
         #true_predictions = [[label_list[p] for p in prediction] for prediction in predictions]
 
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
 
         # Save predictions
-        #output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
-        #if trainer.is_world_process_zero():
-        #    with open(output_test_predictions_file, "w") as writer:
-        #        for prediction in true_predictions:
-        #            writer.write(" ".join(prediction) + "\n")
+        output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
+        if trainer.is_world_process_zero():
+            with open(output_test_predictions_file, "w") as writer:
+                for prediction in true_predictions:
+                    writer.write(" ".join(prediction) + "\n")
 
 
 def _mp_fn(index):

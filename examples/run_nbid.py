@@ -11,12 +11,10 @@ from typing import Optional
 import numpy as np
 from datasets import ClassLabel, load_dataset, load_metric
 
-#import LiLTfinetune.data.datasets.funsd_dataset as dtss
-#import LiLTfinetune.data.datasets.ephoie_dataset as dtss
-import LiLTfinetune.data.datasets.funsd_aug as dtss
-#import LiLTfinetune.data.datasets.funsd as dtss
+import LiLTfinetune.data.datasets.nbid_ocr_dataset
+import LiLTfinetune.data.datasets.nbid_dataset
+import LiLTfinetune.data.datasets.xbid_dataset
 import transformers
-from transformers import EarlyStoppingCallback
 from LiLTfinetune.data import DataCollatorForKeyValueExtraction
 from LiLTfinetune.data.data_args import DataTrainingArguments
 from LiLTfinetune.models.model_args import ModelArguments
@@ -33,6 +31,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+from calc_f1 import get_f1score
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.5.0")
@@ -67,8 +66,6 @@ def main():
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
-    #patience = training_args.patience
-    patience = 30
 
     # Setup logging
     logging.basicConfig(
@@ -92,22 +89,23 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
-    if data_args.n_augs:
-        cfg = f"funsd aug {data_args.n_augs}"
-    else:
-        cfg = "funsd aug 0"
-    if data_args.partition:
-        cfg += f" loo {data_args.partition}"
 
-    datasets = load_dataset(os.path.abspath(dtss.__file__), cfg)
-    print(datasets)
+    print(data_args)
+    print(data_args.dataset_name)
+
+    if data_args.dataset_name == 'xbid':
+        datasets = load_dataset(os.path.abspath(LiLTfinetune.data.datasets.xbid_dataset.__file__))    
+    elif data_args.dataset_name == 'ocr':
+        datasets = load_dataset(os.path.abspath(LiLTfinetune.data.datasets.nbid_ocr_dataset.__file__))
+    else:
+        datasets = load_dataset(os.path.abspath(LiLTfinetune.data.datasets.nbid_dataset.__file__))    
 
     if training_args.do_train:
         column_names = datasets["train"].column_names
         features = datasets["train"].features
     else:
-        column_names = datasets["test"].column_names
-        features = datasets["test"].features
+        column_names = datasets["validation"].column_names
+        features = datasets["validation"].features
     text_column_name = "tokens" if "tokens" in column_names else column_names[0]
     label_column_name = (
         f"{data_args.task_name}_tags" if f"{data_args.task_name}_tags" in column_names else column_names[1]
@@ -133,12 +131,12 @@ def main():
         label_list = get_label_list(datasets["train"][label_column_name])
         label_to_id = {l: i for i, l in enumerate(label_list)}
     num_labels = len(label_list)
-
     # Load pretrained model and tokenizer
     #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+    print(model_args.config_name)
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=num_labels,
@@ -189,14 +187,15 @@ def main():
 
         labels = []
         bboxes = []
-        images = []
+        nodes = []
+        # images = []
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
 
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
-            image = examples["image"][org_batch_index]
+            # image = examples["image"][org_batch_index]
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
@@ -218,11 +217,14 @@ def main():
                 previous_word_idx = word_idx
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
-            images.append(image)
+            nodes.append(examples["node_type"])
+            # images.append(image)
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
-        tokenized_inputs["image"] = images
+        tokenized_inputs["node_type"] = nodes
+        # tokenized_inputs["image"] = images
         return tokenized_inputs
+    print(datasets)
 
     if training_args.do_train:
         if "train" not in datasets:
@@ -256,7 +258,6 @@ def main():
         if "test" not in datasets:
             raise ValueError("--do_predict requires a test dataset")
         test_dataset = datasets["test"]
-        tdts = datasets["test"]
         if data_args.max_test_samples is not None:
             test_dataset = test_dataset.select(range(data_args.max_test_samples))
         test_dataset = test_dataset.map(
@@ -311,13 +312,9 @@ def main():
                 "accuracy": results["overall_accuracy"],
             }
 
-    if patience > 0 and training_args.do_eval:
-        es = EarlyStoppingCallback(early_stopping_patience = patience)
-        cbs = [es]
-    else:
-        cbs = []
-    # Initialize our Trainer
-    print(cbs)
+    #print(train_dataset)
+    #print(len(train_dataset))
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -326,7 +323,6 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=cbs
     )
 
     # Training
@@ -369,7 +365,46 @@ def main():
             [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
             for prediction, label in zip(predictions, labels)
         ]
-        #true_predictions = [[label_list[p] for p in prediction] for prediction in predictions]
+
+        print(len(predictions), len(labels), len(test_dataset))
+        dct = {}
+        dct_r = [{}]
+        dct_s = [{}]
+        dct_c = [{}]
+        for pred, label, inst in zip(predictions, labels, test_dataset):
+            print(inst['node_type'])
+            for p, l, i in zip(pred, label, inst['node_type']):
+                if i == 'root':
+                    ndct = dct_r
+                elif i == 'child':
+                    ndct = dct_c
+                else:
+                    ndct = dct_s
+
+                if l != -100:
+                    lb = label_list[l]
+                    pd = label_list[p]
+                    if lb not in dct:
+                        dct[lb] = {}
+                    if pd not in dct[lb]:
+                        dct[lb][pd] = 0
+                    dct[lb][pd] += 1
+
+                    if lb not in ndct[0]:
+                        ndct[0][lb] = {}
+                    if pd not in ndct[0][lb]:
+                        ndct[0][lb][pd] = 0
+                    ndct[0][lb][pd] += 1
+
+        print(dct, dct_r, dct_s, dct_c)
+        macro_f1_root, micro_f1_root, scores_root = get_f1score(dct_r[0])
+        print("Root scores (macro/micro): ", macro_f1_root, micro_f1_root)
+
+        macro_f1_root, micro_f1_root, scores_root = get_f1score(dct_c[0])
+        print("Children scores (macro/micro): ", macro_f1_root, micro_f1_root)
+
+        macro_f1_root, micro_f1_root, scores_root = get_f1score(dct_s[0])
+        print("Single scores (macro/micro): ", macro_f1_root, micro_f1_root)
 
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
