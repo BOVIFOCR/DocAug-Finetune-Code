@@ -1,2 +1,2 @@
-datasets==1.6.2
-seqeval==1.2.2
+datasets
+seqeval
